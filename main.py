@@ -1,5 +1,5 @@
 # main.py - FastAPI backend
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -8,19 +8,90 @@ import asyncio
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchAny
+from qdrant_client.http.models import PointIdsList
 import httpx
 from dotenv import load_dotenv
 import json
 import os
 import re
+from pathlib import Path
+from typing import List, Optional
+from ingest import ingest_document as ingest_single_document, list_document_ids, qdrant_point_id
 
 load_dotenv()
 
 app = FastAPI()
 
+# Source state tracking
+STATE_FILE = Path("sources_state.json")
+
 # Graphiti session tracking
 graphiti_session_id = None
 graphiti_session_lock = asyncio.Lock()
+
+
+def load_sources_state():
+    if not STATE_FILE.exists():
+        return {"sources": {}}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except json.JSONDecodeError:
+        return {"sources": {}}
+
+
+def save_sources_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def ensure_source_entries(doc_ids: List[str]):
+    state = load_sources_state()
+    changed = False
+    for doc_id in doc_ids:
+        if doc_id not in state["sources"]:
+            state["sources"][doc_id] = {"active": True}
+            changed = True
+    if changed:
+        save_sources_state(state)
+    return state
+
+
+def set_source_active(doc_id: str, active: bool):
+    state = load_sources_state()
+    if doc_id not in state["sources"]:
+        state["sources"][doc_id] = {}
+    state["sources"][doc_id]["active"] = active
+    save_sources_state(state)
+
+
+def get_source_status(doc_id: str) -> bool:
+    state = load_sources_state()
+    entry = state["sources"].get(doc_id)
+    if entry is None:
+        return True
+    return entry.get("active", True)
+
+
+def get_active_sources() -> List[str]:
+    doc_ids = list_document_ids()
+    state = ensure_source_entries(doc_ids)
+    return [
+        doc_id
+        for doc_id in doc_ids
+        if state["sources"].get(doc_id, {}).get("active", True)
+    ]
+
+
+def guess_entities_from_question(question: str) -> List[str]:
+    if not question:
+        return []
+    matches = re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}", question)
+    stopwords = {"Who", "What", "Where", "When", "Why", "How"}
+    guesses = []
+    for match in matches:
+        if match in stopwords:
+            continue
+        guesses.append(match)
+    return guesses
 
 # CORS for frontend
 app.add_middleware(
@@ -406,6 +477,30 @@ def build_relationship_timeline(relationships, max_entries=6):
     return entries
 
 
+async def clear_graphiti_groups(group_ids):
+    if not group_ids:
+        return
+    await call_graphiti_tool(
+        "clear_graph",
+        {
+            "group_ids": group_ids
+        }
+    )
+
+
+def delete_qdrant_points(doc_ids):
+    if not doc_ids:
+        return
+    point_ids = [qdrant_point_id(doc_id) for doc_id in doc_ids]
+    try:
+        qdrant.delete(
+            collection_name="archive_documents",
+            points_selector=PointIdsList(points=point_ids)
+        )
+    except Exception as exc:
+        print(f"Warning: failed to delete Qdrant points {doc_ids}: {exc}")
+
+
 def query_qdrant(question: str, user_permissions: list):
     """Query Qdrant vector database"""
     # Embed question
@@ -449,12 +544,21 @@ async def handle_query(request: QueryRequest):
         ) = await query_graphiti(request.question)
         entity_names = [entity.get("name") for entity in graph_entities if entity.get("name")]
         query_terms = extract_query_terms(request.question)
+        if not entity_names:
+            guessed = guess_entities_from_question(request.question)
+            if guessed:
+                graph_entities = [
+                    {"name": name, "type": "Query Guess", "uuid": None}
+                    for name in guessed
+                ]
+                entity_names = guessed
 
         # 2. Query Qdrant (document chunks)
         print(f"Querying Qdrant: {request.question}")
         doc_results = query_qdrant(request.question, permissions)
 
         graph_episodes = filter_episodes(graph_episodes, entity_names, query_terms)
+        entity_snippets = build_entity_snippets(graph_entities, doc_results)
 
         # 3. Build combined context
         context_parts = []
@@ -503,13 +607,29 @@ async def handle_query(request: QueryRequest):
             context_parts.append(f"{hit.payload['text'][:800]}")  # First 800 chars
 
         # Entity-specific snippets
-        entity_snippets = build_entity_snippets(graph_entities, doc_results)
         if entity_snippets:
             context_parts.append("\nENTITY PROFILES:")
             for profile in entity_snippets:
                 context_parts.append(
                     f"- {profile['name']} ({profile['source']}): {profile['snippet']}"
                 )
+        elif doc_results:
+            # Build a minimal entity list from document mentions when Graphiti has none
+            mention_counts = {}
+            for hit in doc_results:
+                for mention in hit.payload.get("mentions", []):
+                    mention_counts[mention] = mention_counts.get(mention, 0) + 1
+            fallback_entities = sorted(
+                mention_counts.items(),
+                key=lambda item: item[1],
+                reverse=True
+            )[:6]
+            graph_entities = [
+                {"name": name, "type": "Mention", "uuid": None}
+                for name, _ in fallback_entities
+            ]
+            entity_names.extend([name for name, _ in fallback_entities if name not in entity_names])
+            entity_snippets = build_entity_snippets(graph_entities, doc_results)
 
         # Timeline bullets from relationships
         timeline_entries = build_relationship_timeline(graph_relationships)
@@ -517,6 +637,16 @@ async def handle_query(request: QueryRequest):
             context_parts.append("\nTIMELINE HIGHLIGHTS:")
             for entry in timeline_entries:
                 context_parts.append(f"- {entry}")
+
+        if not graph_relationships and entity_snippets:
+            for snippet in entity_snippets:
+                graph_relationships.append({
+                    "from": snippet["source"],
+                    "to": snippet["name"],
+                    "type": "mentions",
+                    "fact": snippet["snippet"],
+                    "followup_question": snippet["snippet"]
+                })
 
         # Fallback episodes from Qdrant hits if Graphiti has none yet
         if doc_results:
@@ -625,6 +755,52 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/sources")
+def list_sources():
+    doc_ids = list_document_ids()
+    state = ensure_source_entries(doc_ids)
+    sources = [
+        {
+            "id": doc_id,
+            "active": state["sources"].get(doc_id, {}).get("active", True)
+        }
+        for doc_id in doc_ids
+    ]
+    return {"sources": sources}
+
+
+@app.post("/sources/{doc_id}/reingest")
+async def reingest_source(doc_id: str):
+    available = list_document_ids()
+    if doc_id not in available:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    delete_qdrant_points([doc_id])
+    await clear_graphiti_groups([doc_id])
+    await ingest_single_document(
+        doc_id,
+        openai_client=openai_client,
+        qdrant_client=qdrant,
+        recreate_collection=False
+    )
+    set_source_active(doc_id, True)
+
+    return {"status": "ok", "doc_id": doc_id}
+
+
+@app.delete("/sources/{doc_id}")
+async def remove_source(doc_id: str):
+    available = list_document_ids()
+    if doc_id not in available:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    delete_qdrant_points([doc_id])
+    await clear_graphiti_groups([doc_id])
+    set_source_active(doc_id, False)
+
+    return {"status": "removed", "doc_id": doc_id}
 
 if __name__ == "__main__":
     import uvicorn

@@ -4,3 +4,5 @@ documents/
 .cursor/
 .cursorrules
 .DS_Store
+__pycache__/
+sources_state.json
