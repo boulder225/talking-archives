@@ -93,6 +93,64 @@ def guess_entities_from_question(question: str) -> List[str]:
         guesses.append(match)
     return guesses
 
+
+def is_noise_entity(entity_name: str) -> bool:
+    """Check if an entity name is likely noise/fragment (structural checks only)."""
+    if not entity_name:
+        return True
+    
+    name = entity_name.strip()
+    
+    # Too short
+    if len(name) < 3:
+        return True
+    
+    words = name.split()
+    
+    # Contains newlines (fragments)
+    if "\n" in name:
+        return True
+    
+    # Very long fragments (> 8 words likely not an entity)
+    if len(words) > 8:
+        return True
+    
+    return False
+
+
+def classify_entity_type(entity_name: str, context_snippets: List[str] = None) -> str:
+    """Classify an entity into Person, Organization, Place, Event, Concept, or Other."""
+    if not entity_name:
+        return "Entity"
+    
+    # Use LLM for classification
+    context_text = ""
+    if context_snippets:
+        context_text = "\n".join(context_snippets[:3])[:500]
+    
+    prompt = f"""Classify the following entity name into one of these types: Person, Organization, Place, Event, Concept, Other.
+
+Entity name: {entity_name}
+Context: {context_text}
+
+Return ONLY the type name (e.g., "Person", "Organization", "Place", "Event", "Concept", "Other")."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=10
+        )
+        classified = response.choices[0].message.content.strip()
+        valid_types = ["Person", "Organization", "Place", "Event", "Concept", "Other"]
+        if classified in valid_types:
+            return classified
+    except Exception as e:
+        print(f"Error classifying entity {entity_name}: {e}")
+    
+    return "Entity"
+
 # CORS for frontend
 app.add_middleware(
     CORSMiddleware,
@@ -108,6 +166,7 @@ qdrant = QdrantClient(host="localhost", port=6333)
 class QueryRequest(BaseModel):
     question: str
     user_id: str = "researcher_1"
+    entity_types: Optional[List[str]] = None
 
 async def query_graphiti(question: str):
     """Query Graphiti knowledge graph for nodes, facts, and episodes."""
@@ -542,7 +601,14 @@ async def handle_query(request: QueryRequest):
             graph_episodes,
             graph_preview
         ) = await query_graphiti(request.question)
+        graph_entities = graph_entities or []
+        # Filter out noise entities
+        graph_entities = [
+            entity for entity in graph_entities
+            if not is_noise_entity(entity.get("name", ""))
+        ]
         entity_names = [entity.get("name") for entity in graph_entities if entity.get("name")]
+        entity_types_filter = {et.lower() for et in (request.entity_types or []) if et}
         query_terms = extract_query_terms(request.question)
         if not entity_names:
             guessed = guess_entities_from_question(request.question)
@@ -557,7 +623,62 @@ async def handle_query(request: QueryRequest):
         print(f"Querying Qdrant: {request.question}")
         doc_results = query_qdrant(request.question, permissions)
 
-        graph_episodes = filter_episodes(graph_episodes, entity_names, query_terms)
+        initial_entity_names = [entity.get("name") for entity in graph_entities if entity.get("name")]
+        graph_episodes = filter_episodes(graph_episodes, initial_entity_names, query_terms)
+
+        # Classify entities that don't have proper types
+        context_snippets = [hit.payload.get("text", "")[:200] for hit in doc_results[:3]]
+        for entity in graph_entities:
+            current_type = entity.get("type", "").strip()
+            if not current_type or current_type == "Entity" or current_type == "Mention":
+                entity_name = entity.get("name", "")
+                if entity_name and not is_noise_entity(entity_name):
+                    classified_type = classify_entity_type(entity_name, context_snippets)
+                    entity["type"] = classified_type
+        
+        # Filter out any noise entities that slipped through
+        graph_entities = [
+            entity for entity in graph_entities
+            if not is_noise_entity(entity.get("name", ""))
+        ]
+
+        # Fallback entities if none returned
+        if not graph_entities and doc_results:
+            mention_counts = {}
+            for hit in doc_results:
+                for mention in hit.payload.get("mentions", []):
+                    mention_counts[mention] = mention_counts.get(mention, 0) + 1
+            fallback_entities = sorted(
+                mention_counts.items(),
+                key=lambda item: item[1],
+                reverse=True
+            )[:6]
+            graph_entities = []
+            for name, _ in fallback_entities:
+                if not is_noise_entity(name):
+                    classified_type = classify_entity_type(name, context_snippets)
+                    graph_entities.append({
+                        "name": name,
+                        "type": classified_type,
+                        "uuid": None
+                    })
+
+        entity_types_available = sorted(
+            {
+                entity.get("type")
+                for entity in graph_entities
+                if entity.get("type")
+            }
+        )
+
+        if entity_types_filter:
+            graph_entities = [
+                entity
+                for entity in graph_entities
+                if (entity.get("type") or "").lower() in entity_types_filter
+            ]
+
+        entity_names = [entity.get("name") for entity in graph_entities if entity.get("name")]
         entity_snippets = build_entity_snippets(graph_entities, doc_results)
 
         # 3. Build combined context
@@ -718,6 +839,12 @@ Provide a comprehensive answer with citations to document titles. If the context
 
         answer = response.choices[0].message.content
 
+        # Final filter to remove any noise entities before returning
+        graph_entities = [
+            entity for entity in graph_entities
+            if not is_noise_entity(entity.get("name", ""))
+        ]
+
         # 5. Return structured response
         return {
             "answer": answer,
@@ -731,7 +858,8 @@ Provide a comprehensive answer with citations to document titles. If the context
             "graph_context": (graph_preview or "")[:200],  # Preview
             "graph_entities": graph_entities,
             "graph_relationships": graph_relationships,
-            "graph_episodes": filter_episodes(graph_episodes, entity_names, query_terms)
+            "graph_episodes": filter_episodes(graph_episodes, entity_names, query_terms),
+            "available_entity_types": entity_types_available
         }
 
     except Exception as e:
