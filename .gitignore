@@ -1,0 +1,5 @@
+venv/
+.env
+documents/
+.cursor/
+.cursorrules
