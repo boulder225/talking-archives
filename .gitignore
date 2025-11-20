@@ -3,3 +3,4 @@ venv/
 documents/
 .cursor/
 .cursorrules
+.DS_Store
