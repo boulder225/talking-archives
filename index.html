@@ -63,6 +63,19 @@
             </div>
         </div>
 
+        <div class="mb-4">
+            <label class="block text-sm font-medium text-gray-700 mb-2">
+                Temporarily exclude sources (optional):
+                <a href="#" onclick="resetAllExcludedSources(); return false;" 
+                   class="ml-2 text-xs text-indigo-600 hover:text-indigo-800 underline">
+                    reset-all
+                </a>
+            </label>
+            <div class="flex flex-wrap gap-2 text-sm" id="exclude-sources-filters">
+                <span class="text-gray-500">Loading sources...</span>
+            </div>
+        </div>
+
         <button
                 onclick="search()"
                 class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-lg transition duration-200 text-lg"
@@ -94,13 +107,36 @@
             </div>
 
             <div id="relationships-container" class="hidden">
-                <h4 class="font-medium text-gray-700 mb-2 text-sm">Relationships:</h4>
-                <ul id="relationships" class="space-y-1 text-sm"></ul>
+                <h4 class="font-medium text-gray-700 mb-2 text-sm">Follow-up Questions:</h4>
+                <ul id="relationships" class="space-y-2 text-sm"></ul>
             </div>
 
             <div id="episodes-container" class="hidden mt-4">
                 <h4 class="font-medium text-gray-700 mb-2 text-sm">Episodes:</h4>
                 <ul id="episodes" class="space-y-2 text-sm"></ul>
+            </div>
+
+            <!-- Graph Viewer Link -->
+            <div id="embedded-graph-container" class="hidden mt-4">
+                <h4 class="font-medium text-gray-700 mb-2 text-sm">Interactive Graph View (Graphiti UI):</h4>
+                <a
+                    id="graph-view-link"
+                    href="#"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="inline-flex items-center px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg transition-colors text-sm"
+                >
+                    <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                    </svg>
+                    Open Graphiti Graph Viewer in New Window
+                </a>
+                <div id="query-context" class="mt-2 p-2 bg-gray-50 rounded text-xs text-gray-600">
+                    <span class="font-medium">Query:</span> <span id="query-text" class="font-mono"></span>
+                </div>
+                <p class="mt-2 text-xs text-gray-500">
+                    Opens the interactive graph visualization. You can search for entities or terms in the Graphiti UI.
+                </p>
             </div>
         </div>
 
@@ -142,7 +178,13 @@
 </div>
 
 <script>
+    // Dynamic API base URL - uses current hostname so it works from remote PCs
+    const API_BASE = `${window.location.protocol}//${window.location.hostname}:8080`;
+    // Graphiti UI base URL (for embedded /graph view)
+    const GRAPH_BASE = `${window.location.protocol}//${window.location.hostname}:3000`;
+    
     let selectedEntityTypes = new Set();
+    let excludedSources = new Set();
     let isSearching = false;
 
     function setQuery(text) {
@@ -154,6 +196,7 @@
         if (isSearching) return;
         const question = document.getElementById('question').value.trim();
         const selectedTypes = Array.from(selectedEntityTypes);
+        const excluded = Array.from(excludedSources);
 
         if (!question) {
             alert('Please enter a question');
@@ -166,7 +209,7 @@
 
         isSearching = true;
         try {
-            const response = await fetch('http://localhost:8080/query', {
+            const response = await fetch(`${API_BASE}/query`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -174,7 +217,8 @@
                 body: JSON.stringify({
                     question: question,
                     user_id: 'researcher_1',
-                    entity_types: selectedTypes
+                    entity_types: selectedTypes,
+                    excluded_sources: excluded
                 })
             });
 
@@ -192,6 +236,20 @@
             if (data.graph_entities && data.graph_entities.length > 0) {
                 graphSection.classList.remove('hidden');
 
+                // Update Graphiti graph viewer link (just link to /graph, no query params)
+                const graphWidget = document.getElementById('embedded-graph-container');
+                const graphLink = document.getElementById('graph-view-link');
+                const queryText = document.getElementById('query-text');
+                if (graphWidget && graphLink) {
+                    // Link directly to /graph - the UI doesn't accept query parameters
+                    graphLink.href = `${GRAPH_BASE}/graph`;
+                    // Display the query text so users can copy/search in the UI
+                    if (queryText) {
+                        queryText.textContent = question;
+                    }
+                    graphWidget.classList.remove('hidden');
+                }
+
                 const entitiesDiv = document.getElementById('entities');
                 entitiesDiv.innerHTML = '';
 
@@ -201,6 +259,10 @@
                         ? `${entity.name || 'Unknown'} (${entity.type})`
                         : (entity.name || 'Unknown');
 
+                    // Create container for entity button with source info
+                    const container = document.createElement('div');
+                    container.className = 'flex flex-col items-start';
+                    
                     const button = document.createElement('button');
                     button.className = 'px-3 py-1 bg-indigo-100 text-indigo-800 rounded-full text-sm font-medium hover:bg-indigo-200 transition';
                     button.textContent = label;
@@ -209,7 +271,34 @@
                             askFollowUp(`Tell me more about ${entity.name}`);
                         }
                     });
-                    entitiesDiv.appendChild(button);
+                    container.appendChild(button);
+                    
+                    // Show document source if available
+                    if (entity.doc_id || entity.group_id) {
+                        const sourceSpan = document.createElement('span');
+                        sourceSpan.className = 'text-xs text-gray-500 ml-3 mt-1';
+                        const docName = entity.doc_id || entity.group_id;
+                        sourceSpan.textContent = `📄 ${docName}`;
+                        container.appendChild(sourceSpan);
+                    }
+                    
+                    // Show warning if entity verification failed
+                    if (entity._verification_failed) {
+                        const warningSpan = document.createElement('span');
+                        warningSpan.className = 'text-xs text-orange-600 ml-3 mt-1 italic';
+                        warningSpan.textContent = `⚠️ Not found in ${entity._verification_failed}`;
+                        container.appendChild(warningSpan);
+                    }
+                    
+                    // Show warning if entity not found in any document
+                    if (entity._not_found_in_docs) {
+                        const warningSpan = document.createElement('span');
+                        warningSpan.className = 'text-xs text-orange-600 ml-3 mt-1 italic';
+                        warningSpan.textContent = `⚠️ Not found in documents`;
+                        container.appendChild(warningSpan);
+                    }
+                    
+                    entitiesDiv.appendChild(container);
                 });
 
                 // Show relationships if present
@@ -221,37 +310,12 @@
 
                 data.graph_relationships.forEach(rel => {
                     const li = document.createElement('li');
-                    li.className = 'text-gray-700 border border-gray-200 rounded-lg p-3 space-y-2';
-
-                    if (rel.from || rel.to) {
-                        const header = document.createElement('div');
-                        header.className = 'flex items-center';
-                        header.innerHTML = `
-                            <span class="text-indigo-600 mr-2">→</span>
-                            <span><strong>${rel.from || 'Unknown'}</strong>
-                            <span class="text-gray-500 mx-2">${rel.type || 'connected to'}</span>
-                            <strong>${rel.to || 'Unknown'}</strong></span>
-                        `;
-                        li.appendChild(header);
-                    }
-
-                    const factText = rel.fact || 'Relationship details unavailable';
-                    const factDiv = document.createElement('div');
-                    factDiv.className = 'text-sm text-gray-600';
-                    factDiv.textContent = factText;
-                    li.appendChild(factDiv);
-
-                    if (rel.valid_from || rel.valid_to) {
-                        const timeDiv = document.createElement('div');
-                        timeDiv.className = 'text-xs text-gray-500';
-                        timeDiv.textContent = `Valid: ${rel.valid_from || '?'} → ${rel.valid_to || 'present'}`;
-                        li.appendChild(timeDiv);
-                    }
+                    li.className = 'text-gray-700';
 
                     if (rel.followup_question) {
                         const button = document.createElement('button');
-                        button.className = 'text-xs text-indigo-700 font-semibold hover:underline';
-                        button.textContent = 'Ask follow-up';
+                        button.className = 'text-sm text-indigo-700 font-semibold hover:underline bg-indigo-50 rounded-lg border border-indigo-200 px-3 py-2 w-full text-left hover:bg-indigo-100 transition-colors flex items-center space-x-2';
+                        button.innerHTML = `<span class="text-base">💭</span> <span>${rel.followup_question}</span>`;
                         button.addEventListener('click', () => askFollowUp(rel.followup_question));
                         li.appendChild(button);
                     }
@@ -332,7 +396,7 @@
                         <span class="text-indigo-600 mr-2 mt-1">•</span>
                         <span class="text-gray-700">
                             <strong>${source.title}</strong>
-                            <span class="text-gray-500 text-sm">(relevance: ${(source.relevance * 100).toFixed(1)}%)</span>
+                            <span class="text-gray-500 text-sm">(relevance: ${Math.min(source.relevance * 100, 100).toFixed(1)}%)</span>
                         </span>
                     `;
                     sourcesList.appendChild(li);
@@ -407,17 +471,89 @@
         });
     }
 
+    function populateExcludeSourceFilters(sources) {
+        const container = document.getElementById('exclude-sources-filters');
+        if (!container) {
+            console.error('exclude-sources-filters element not found');
+            return;
+        }
+        container.innerHTML = '';
+
+        if (!sources || sources.length === 0) {
+            container.innerHTML = '<span class="text-gray-500">No sources available.</span>';
+            return;
+        }
+
+        // Only show active sources for exclusion
+        const activeSources = sources.filter(s => {
+            const active = typeof s === 'object' ? s.active : true;
+            return active;
+        });
+
+        if (activeSources.length === 0) {
+            container.innerHTML = '<span class="text-gray-500">No active sources to exclude.</span>';
+            return;
+        }
+
+        activeSources.forEach(entry => {
+            const docId = typeof entry === 'string' ? entry : entry.id;
+            const button = document.createElement('button');
+            button.className = 'exclude-source-chip px-3 py-1 border border-gray-200 rounded-full text-sm text-gray-700 hover:bg-gray-50 transition';
+            button.dataset.sourceId = docId;
+            button.textContent = docId;
+
+            if (excludedSources.has(docId)) {
+                button.classList.add('excluded', 'bg-red-100', 'text-red-700', 'border-red-300');
+            }
+
+            button.addEventListener('click', () => {
+                if (excludedSources.has(docId)) {
+                    excludedSources.delete(docId);
+                    button.classList.remove('excluded', 'bg-red-100', 'text-red-700', 'border-red-300');
+                } else {
+                    excludedSources.add(docId);
+                    button.classList.add('excluded', 'bg-red-100', 'text-red-700', 'border-red-300');
+                }
+            });
+
+            container.appendChild(button);
+        });
+    }
+
+    function resetAllExcludedSources() {
+        // Clear all excluded sources
+        excludedSources.clear();
+        
+        // Refresh the UI by removing excluded styling from all buttons
+        const container = document.getElementById('exclude-sources-filters');
+        if (container) {
+            const buttons = container.querySelectorAll('.exclude-source-chip');
+            buttons.forEach(button => {
+                button.classList.remove('excluded', 'bg-red-100', 'text-red-700', 'border-red-300');
+            });
+        }
+    }
+
     async function loadSources() {
         const status = document.getElementById('source-status');
         const list = document.getElementById('sources-list');
+        
+        if (!status || !list) {
+            console.error('Source management elements not found:', {status: !!status, list: !!list});
+            return;
+        }
+        
         status.classList.remove('hidden');
         status.textContent = 'Loading sources...';
         list.innerHTML = '';
 
         try {
-            const response = await fetch('http://localhost:8080/sources');
+            const response = await fetch(`${API_BASE}/sources`);
             if (!response.ok) throw new Error(await response.text());
             const data = await response.json();
+
+            // Update exclude filters
+            populateExcludeSourceFilters(data.sources || []);
 
             if (!data.sources || data.sources.length === 0) {
                 list.innerHTML = '<li class="text-gray-500">No documents found.</li>';
@@ -427,10 +563,15 @@
                     const active = typeof entry === 'object' ? entry.active : true;
                     const li = document.createElement('li');
                     li.className = 'flex items-center justify-between border border-gray-100 rounded-md px-3 py-2';
-                    const actionsId = `actions-${docId}`;
+                    
+                    // Create safe ID by replacing spaces and special characters
+                    const safeId = docId.replace(/[^a-zA-Z0-9]/g, '_');
+                    const actionsId = `actions-${safeId}`;
+                    
                     const statusBadge = active
                         ? '<span class="text-xs text-green-700 bg-green-50 border border-green-100 px-2 py-0.5 rounded-full mr-3">Active</span>'
                         : '<span class="text-xs text-red-700 bg-red-50 border border-red-100 px-2 py-0.5 rounded-full mr-3">Removed</span>';
+                    
                     li.innerHTML = `
                         <div class="flex items-center">
                             ${statusBadge}
@@ -442,6 +583,7 @@
                             </button>
                         </div>
                     `;
+                    
                     const actions = li.querySelectorAll(`#${actionsId} button`);
                     actions.forEach(button => {
                         const action = button.dataset.action;
@@ -451,15 +593,21 @@
                     });
 
                     const actionsContainer = li.querySelector(`#${actionsId}`);
-                    if (active) {
+                    if (active && actionsContainer) {
                         const removeButton = document.createElement('button');
                         removeButton.className = 'text-sm text-red-700 font-semibold hover:underline';
                         removeButton.textContent = 'Remove';
                         removeButton.addEventListener('click', () => removeSource(docId, removeButton));
                         actionsContainer.appendChild(removeButton);
+                    } else if (active && !actionsContainer) {
+                        console.error(`Actions container not found for ${docId} (ID: ${actionsId})`);
                     }
 
-                    list.appendChild(li);
+                    if (list) {
+                        list.appendChild(li);
+                    } else {
+                        console.error('Cannot append to null list element');
+                    }
                 });
             }
             status.textContent = 'Sources loaded.';
@@ -486,7 +634,7 @@
         status.textContent = `Re-ingesting ${docId}...`;
 
         try {
-            const response = await fetch(`http://localhost:8080/sources/${docId}/reingest`, {
+            const response = await fetch(`${API_BASE}/sources/${docId}/reingest`, {
                 method: 'POST'
             });
             if (!response.ok) throw new Error(await response.text());
@@ -514,7 +662,7 @@
         status.textContent = `Removing ${docId}...`;
 
         try {
-            const response = await fetch(`http://localhost:8080/sources/${docId}`, {
+            const response = await fetch(`${API_BASE}/sources/${docId}`, {
                 method: 'DELETE'
             });
             if (!response.ok) throw new Error(await response.text());

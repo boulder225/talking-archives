@@ -82,15 +82,77 @@ def get_active_sources() -> List[str]:
 
 
 def guess_entities_from_question(question: str) -> List[str]:
+    """Extract potential entity names from question text."""
     if not question:
         return []
-    matches = re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}", question)
-    stopwords = {"Who", "What", "Where", "When", "Why", "How"}
+    
+    # First, try to extract full proper names (handles consecutive capitals like "MacGuigan")
+    # Pattern: Capital letter, then lowercase, optionally followed by capital+lowercase (for names like MacGuigan)
+    # Then optionally space + capital+lowercase (for first+last names)
+    full_name_pattern = r"[A-Z][a-z]+(?:[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+(?:[A-Z][a-z]+)*)*"
+    full_matches = re.findall(full_name_pattern, question)
+    
+    # Also get simple capitalized words/phrases
+    simple_pattern = r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}"
+    simple_matches = re.findall(simple_pattern, question)
+    
+    # Prefer full matches (handle consecutive capitals), filter out fragments
+    stopwords = {"Who", "What", "Where", "When", "Why", "How", "Summarize", "Tell", "Show", "Write", "Wrote"}
     guesses = []
-    for match in matches:
-        if match in stopwords:
+    
+    # First, prioritize full matches (they handle names with consecutive capitals)
+    for match in full_matches:
+        match = match.strip()
+        if not match or match in stopwords:
             continue
+        
+        # Filter out very short or very long matches
+        if len(match) < 4 or len(match.split()) > 4:
+            continue
+        
+        # Check if this is a fragment/subset of another full match
+        is_fragment = any(
+            match != other and (match in other or match.lower() in other.lower())
+            for other in full_matches
+            if other != match
+        )
+        if is_fragment:
+            continue
+            
         guesses.append(match)
+    
+    # Only add simple matches that aren't already covered by full matches
+    for match in simple_matches:
+        match = match.strip()
+        if not match or match in stopwords:
+            continue
+        
+        # Filter out very short or very long matches
+        if len(match) < 4 or len(match.split()) > 4:
+            continue
+        
+        # Skip if it's already in full matches or is a fragment
+        is_already_covered = any(
+            match in full_match or match.lower() in full_match.lower()
+            for full_match in full_matches
+        )
+        if is_already_covered:
+            continue
+        
+        # Check if it's a subset of another match
+        is_subset = any(
+            match != other and (match in other or match.lower() in other.lower())
+            for other in full_matches + simple_matches
+            if other != match
+        )
+        if is_subset:
+            continue
+            
+        guesses.append(match)
+    
+    # Sort by length (longest first) to prioritize full names
+    guesses.sort(key=len, reverse=True)
+    
     return guesses
 
 
@@ -118,6 +180,56 @@ def is_noise_entity(entity_name: str) -> bool:
     return False
 
 
+def generate_contextual_followup(entity_name: str, context: str) -> str:
+    """Generate a meaningful follow-up question based on the relationship context."""
+    # Clean up entity name for better questions
+    if not entity_name or entity_name.strip() == "":
+        entity_name = "this entity"
+    else:
+        # If entity name is too long (like addresses), shorten it
+        if len(entity_name) > 50:
+            # Try to extract the main part (before comma or first few words)
+            if ',' in entity_name:
+                entity_name = entity_name.split(',')[0].strip()
+            else:
+                words = entity_name.split()
+                if len(words) > 6:
+                    entity_name = ' '.join(words[:6]) + "..."
+    
+    context_lower = context.lower()
+    
+    # Analyze the context to determine what kind of question would be most relevant
+    if any(word in context_lower for word in ["published", "mailed", "distributed", "scattered", "received"]):
+        return f"How was {entity_name} distributed and what was its impact?"
+    
+    elif any(word in context_lower for word in ["committee", "organization", "group", "association", "party"]):
+        return f"What role did {entity_name} play in these events?"
+    
+    elif any(word in context_lower for word in ["report", "study", "investigation", "findings"]):
+        return f"What were the key findings about {entity_name}?"
+    
+    elif any(word in context_lower for word in ["date", "year", "month", "time", "when"]) and any(char.isdigit() for char in context):
+        return f"What happened with {entity_name} during this time period?"
+    
+    elif any(word in context_lower for word in ["location", "address", "street", "city", "province", "from", "to"]):
+        return f"What is the significance of {entity_name} in this location?"
+    
+    elif any(word in context_lower for word in ["content", "message", "text", "entitled", "titled"]):
+        return f"What was the content and purpose of {entity_name}?"
+    
+    elif any(word in context_lower for word in ["effect", "impact", "result", "consequence", "outcome"]):
+        return f"What were the effects and consequences of {entity_name}?"
+    
+    elif any(word in context_lower for word in ["law", "legal", "court", "justice", "regulation"]):
+        return f"What legal implications were associated with {entity_name}?"
+    
+    else:
+        # Default to a more specific question based on context length and content
+        if len(context) > 100:
+            return f"What was the broader context and significance of {entity_name}?"
+        else:
+            return f"What more details are available about {entity_name}?"
+
 def classify_entity_type(entity_name: str, context_snippets: List[str] = None) -> str:
     """Classify an entity into Person, Organization, Place, Event, Concept, or Other."""
     if not entity_name:
@@ -139,8 +251,9 @@ Return ONLY the type name (e.g., "Person", "Organization", "Place", "Event", "Co
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=10
+            temperature=0.0,
+            max_tokens=10,
+            seed=42
         )
         classified = response.choices[0].message.content.strip()
         valid_types = ["Person", "Organization", "Place", "Event", "Concept", "Other"]
@@ -167,13 +280,45 @@ class QueryRequest(BaseModel):
     question: str
     user_id: str = "researcher_1"
     entity_types: Optional[List[str]] = None
+    excluded_sources: Optional[List[str]] = None
 
-async def query_graphiti(question: str):
+def get_all_group_ids():
+    """Get all available group_ids by converting document IDs to sanitized group_ids."""
+    doc_ids = list_document_ids()
+    # Convert document IDs to sanitized group_ids (same logic as ingestion)
+    import re
+    group_ids = [re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id) for doc_id in doc_ids]
+    return group_ids
+
+
+def group_id_to_doc_id(group_id: str) -> Optional[str]:
+    """Convert a group_id back to the original document ID."""
+    if not group_id:
+        return None
+    doc_ids = list_document_ids()
+    import re
+    for doc_id in doc_ids:
+        sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id)
+        if sanitized == group_id:
+            return doc_id
+    return None
+
+async def query_graphiti(question: str, allowed_sources: Optional[List[str]] = None):
     """Query Graphiti knowledge graph for nodes, facts, and episodes."""
+    # Get group_ids - filter by allowed sources if provided
+    if allowed_sources is not None:
+        # Convert allowed doc_ids to group_ids
+        import re
+        group_ids = [re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id) for doc_id in allowed_sources]
+    else:
+        # Get all available group_ids to search across all documents
+        group_ids = get_all_group_ids()
+    
     nodes_struct, nodes_preview = await call_graphiti_tool(
         "search_nodes",
         {
             "query": question,
+            "group_ids": group_ids,
             "max_nodes": 10
         }
     )
@@ -182,16 +327,27 @@ async def query_graphiti(question: str):
         "search_memory_facts",
         {
             "query": question,
+            "group_ids": group_ids,
             "max_facts": 10
         }
     )
+    
+    # Debug: print what we're getting from facts search
+    print(f"DEBUG: Facts search for '{question}' returned:")
+    print(f"  facts_struct: {facts_struct}")
+    print(f"  facts_preview: {facts_preview[:200] if facts_preview else 'None'}...")
+    
+    print(f"DEBUG: About to call get_episodes...")
 
     episodes_struct, episodes_preview = await call_graphiti_tool(
         "get_episodes",
         {
+            "group_ids": group_ids,
             "max_episodes": 5
         }
     )
+    
+    print(f"DEBUG: About to call normalize_graphiti_results...")
 
     (
         graph_entities,
@@ -202,6 +358,8 @@ async def query_graphiti(question: str):
         facts_struct,
         episodes_struct
     )
+    
+    print(f"DEBUG: normalize_graphiti_results returned {len(graph_relationships)} relationships")
 
     preview_parts = list(
         filter(
@@ -211,7 +369,7 @@ async def query_graphiti(question: str):
     )
     preview_text = "\n\n".join(preview_parts)
 
-    return graph_entities, graph_relationships, graph_episodes, preview_text
+    return graph_entities, graph_relationships, graph_episodes, preview_text, facts_struct
 
 
 async def ensure_graphiti_session():
@@ -265,24 +423,24 @@ async def call_graphiti_tool(name: str, arguments: dict):
     for _ in range(2):
         session_id = await ensure_graphiti_session()
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=45.0) as client:
             response = await client.post(
                 "http://localhost:8000/mcp",
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json, text/event-stream",
                     "MCP-Session-Id": session_id
-                },
-                json={
-                    "jsonrpc": "2.0",
-                    "method": "tools/call",
-                    "params": {
+            },
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
                         "name": name,
                         "arguments": arguments
-                    },
-                    "id": 1
-                }
-            )
+                },
+                "id": 1
+            }
+        )
 
         response_text = response.text
 
@@ -358,75 +516,96 @@ def _unwrap_structured(structured):
 
 def normalize_graphiti_results(nodes_struct, facts_struct, episodes_struct):
     """Convert Graphiti structured results into frontend-friendly lists."""
+    print(f"DEBUG: normalize_graphiti_results called with facts_struct: {type(facts_struct)}")
     entities = []
     relationships = []
     episodes = []
+
+    # Build episode group_id mapping for entity attribution
+    episodes_data = _unwrap_structured(episodes_struct)
+    episode_to_group_id = {}
+    for episode in episodes_data.get("episodes", []) or []:
+        if not isinstance(episode, dict):
+            continue
+        episode_name = episode.get("name", "")
+        metadata = episode.get("metadata") or {}
+        # Try to extract group_id from episode name (format: "DOC_NAME (Part X)")
+        if episode_name:
+            # Extract base document name before " (Part"
+            base_name = episode_name.split(" (Part")[0]
+            # Convert to group_id format (sanitized)
+            import re
+            group_id = re.sub(r'[^a-zA-Z0-9_-]', '_', base_name)
+            episode_to_group_id[episode_name] = group_id
+        # Also check metadata
+        if metadata.get("group_id"):
+            episode_to_group_id[episode_name] = metadata.get("group_id")
 
     nodes_data = _unwrap_structured(nodes_struct)
     for node in nodes_data.get("nodes", []) or []:
         if not isinstance(node, dict):
             continue
         labels = node.get("labels") or []
-        entity_type = labels[0] if labels else node.get("attributes", {}).get("type")
-        entities.append({
+        attributes = node.get("attributes") or {}
+        entity_type = labels[0] if labels else attributes.get("type")
+        
+        # Try to extract group_id from node attributes or metadata
+        group_id = attributes.get("group_id") or node.get("group_id")
+        
+        entity = {
             "name": node.get("name") or node.get("label"),
             "type": entity_type,
             "uuid": node.get("uuid")
-        })
+        }
+        
+        # Add group_id if we found it
+        if group_id:
+            entity["group_id"] = group_id
+        
+        entities.append(entity)
 
     facts_data = _unwrap_structured(facts_struct)
+    
     for fact in facts_data.get("facts", []) or []:
         if not isinstance(fact, dict):
             continue
 
-        source = fact.get("source") or {}
-        target = fact.get("target") or {}
+        # Extract the fact text which contains the relationship information
+        fact_text = fact.get("fact", "")
+        relationship_name = fact.get("name", "")
+        
+        # Generate a better follow-up question based on the actual fact content
+        if fact_text:
+            followup_question = generate_fact_based_followup(fact_text, relationship_name)
+            
+            rel_entry = {
+                "from": "",  # We don't have direct node names, the fact text contains the full relationship
+                "to": "",
+                "type": relationship_name or "relationship",
+                "valid_from": fact.get("valid_at"),
+                "valid_to": fact.get("expired_at"),
+                "fact": fact_text,
+                "followup_question": followup_question
+            }
+            relationships.append(rel_entry)
 
-        rel_entry = {
-            "from": (
-                fact.get("source_name")
-                or source.get("name")
-                or fact.get("from")
-            ),
-            "to": (
-                fact.get("target_name")
-                or target.get("name")
-                or fact.get("to")
-            ),
-            "type": (
-                fact.get("relationship_type")
-                or fact.get("type")
-                or fact.get("relation")
-                or fact.get("predicate")
-            ),
-            "valid_from": (
-                fact.get("valid_from")
-                or fact.get("start_time")
-                or fact.get("startDate")
-            ),
-            "valid_to": (
-                fact.get("valid_to")
-                or fact.get("end_time")
-                or fact.get("endDate")
-            ),
-            "fact": (
-                fact.get("fact")
-                or fact.get("summary")
-                or fact.get("description")
-                or fact.get("text")
-            )
-        }
-        rel_entry["followup_question"] = generate_follow_up_question(rel_entry)
-        relationships.append(rel_entry)
-
-    episodes_data = _unwrap_structured(episodes_struct)
+    # Process episodes (already loaded above)
     for episode in episodes_data.get("episodes", []) or []:
         if not isinstance(episode, dict):
             continue
 
         metadata = episode.get("metadata") or {}
-        episodes.append({
-            "name": episode.get("name"),
+        episode_name = episode.get("name", "")
+        
+        # Extract group_id from episode name or metadata
+        group_id = None
+        if episode_name in episode_to_group_id:
+            group_id = episode_to_group_id[episode_name]
+        elif metadata.get("group_id"):
+            group_id = metadata.get("group_id")
+        
+        episode_entry = {
+            "name": episode_name,
             "content": (
                 episode.get("content")
                 or episode.get("episode_body")
@@ -437,24 +616,94 @@ def normalize_graphiti_results(nodes_struct, facts_struct, episodes_struct):
                 or metadata.get("reference_time")
                 or metadata.get("timestamp")
             )
-        })
+        }
+        
+        if group_id:
+            episode_entry["group_id"] = group_id
+        
+        episodes.append(episode_entry)
+        
+        # Map entities to group_id based on episode content
+        # If entity appears in episode, attribute it to this document
+        if group_id and episode_entry.get("content"):
+            episode_content = episode_entry["content"].lower()
+            for entity in entities:
+                entity_name = entity.get("name", "").lower()
+                if entity_name and entity_name in episode_content and not entity.get("group_id"):
+                    entity["group_id"] = group_id
 
     return entities, relationships, episodes
 
+
+def generate_fact_based_followup(fact_text: str, relationship_type: str = "") -> str:
+    """Generate a relevant follow-up question based on the actual fact content."""
+    if not fact_text:
+        return "What more information is available about this topic?"
+    
+    fact_lower = fact_text.lower()
+    
+    # Extract the main subject from the fact (usually the first entity mentioned)
+    import re
+    
+    # Try to extract person names (capitalized words before "was" or "is")
+    person_match = re.search(r'([A-Z][a-z]+(?: [A-Z][a-z]+)*)\s+(?:was|is)', fact_text)
+    if person_match:
+        person_name = person_match.group(1)
+        
+        # Generate questions based on relationship type and content
+        if any(word in fact_lower for word in ["principal", "dean", "professor", "associate professor"]):
+            return f"What other roles did {person_name} have in academia?"
+        elif any(word in fact_lower for word in ["committee", "member", "chairman"]):
+            return f"What was {person_name}'s contribution to this committee?"
+        elif any(word in fact_lower for word in ["received", "mailed", "distributed"]):
+            return f"What was the impact of materials involving {person_name}?"
+        else:
+            return f"What other activities was {person_name} involved in?"
+    
+    # Handle organizational or location-based facts
+    if any(word in fact_lower for word in ["university", "college", "faculty"]):
+        institution_match = re.search(r'((?:[A-Z][a-z]+\s+)*University|(?:[A-Z][a-z]+\s+)*College)', fact_text)
+        if institution_match:
+            institution = institution_match.group(1)
+            return f"What role did {institution} play in these events?"
+    
+    # Handle pamphlet/document distribution
+    if any(word in fact_lower for word in ["pamphlet", "leaflet", "distributed", "scattered", "mailed"]):
+        if "students" in fact_lower:
+            return "How did students respond to these materials?"
+        elif "campus" in fact_lower:
+            return "What was the campus reaction to these materials?"
+        else:
+            return "What was the broader impact of this distribution?"
+    
+    # Handle geographic/location facts
+    if any(word in fact_lower for word in ["montreal", "toronto", "ontario", "quebec", "hamilton"]):
+        location_match = re.search(r'([A-Z][a-z]+(?:,?\s+[A-Z][a-z]+)*)', fact_text)
+        if location_match and any(word in location_match.group(1).lower() for word in ["montreal", "toronto", "ontario", "quebec", "hamilton"]):
+            return f"What other activities occurred in this region during this period?"
+    
+    # Default based on relationship type
+    if relationship_type:
+        if "AFFILIATED_WITH" in relationship_type or "MEMBER" in relationship_type:
+            return "What other institutional connections existed?"
+        elif "DISTRIBUTED" in relationship_type or "RECEIVED" in relationship_type:
+            return "How widespread was this distribution network?"
+        elif "COMPARED_WITH" in relationship_type:
+            return "What were the key differences in approaches?"
+    
+    # Generic fallback
+    return "What additional context is available about this topic?"
 
 def generate_follow_up_question(relationship):
     """Create a follow-up question for a single relationship."""
     if not relationship:
         return None
 
-    fact = relationship.get("fact")
-    rel_type = relationship.get("type") or "relationship"
-    source = relationship.get("from") or "this entity"
-    target = relationship.get("to") or "the related party"
-
-    if fact:
-        return fact
-    return f"What does the {rel_type} between {source} and {target} reveal?"
+    fact = relationship.get("fact", "")
+    target = relationship.get("to") or relationship.get("from") or "this entity"
+    
+    # Use the contextual followup generator for better questions
+    return generate_contextual_followup(target, fact)
 
 
 def extract_query_terms(question: str):
@@ -560,31 +809,148 @@ def delete_qdrant_points(doc_ids):
         print(f"Warning: failed to delete Qdrant points {doc_ids}: {exc}")
 
 
-def query_qdrant(question: str, user_permissions: list):
-    """Query Qdrant vector database"""
+def verify_entity_in_document(entity_name: str, doc_id: str) -> bool:
+    """Verify that an entity actually exists in the specified document."""
+    try:
+        from ingest import read_document_text
+        text = read_document_text(doc_id)
+        # Case-insensitive search
+        return entity_name.lower() in text.lower()
+    except Exception as e:
+        print(f"Warning: Could not verify entity '{entity_name}' in '{doc_id}': {e}")
+        return False
+
+
+def map_entity_to_documents(entity_name: str) -> List[str]:
+    """Find which documents actually contain this entity by searching document text."""
+    matching_docs = []
+    doc_ids = list_document_ids()
+    
+    for doc_id in doc_ids:
+        if verify_entity_in_document(entity_name, doc_id):
+            matching_docs.append(doc_id)
+    
+    return matching_docs
+
+
+def query_qdrant(question: str, user_permissions: list, excluded_sources: Optional[List[str]] = None):
+    """Query Qdrant vector database with hybrid search (semantic + keyword)"""
     # Embed question
     embedding = openai_client.embeddings.create(
         input=question,
         model="text-embedding-3-small"
     ).data[0].embedding
 
-    # Search with governance filter
+    # Get active sources
+    active_sources = get_active_sources()
+    excluded_sources = excluded_sources or []
+    # Filter out excluded sources
+    allowed_sources = [s for s in active_sources if s not in excluded_sources]
+    
+    if not allowed_sources:
+        return []
+
+    # Search with governance filter and source filter
+    filter_conditions = [
+        FieldCondition(
+            key="access_level",
+            match=MatchAny(any=user_permissions)
+        )
+    ]
+    
+    # Add source filter (filter by payload.doc_id)
+    if allowed_sources:
+        filter_conditions.append(
+            FieldCondition(
+                key="doc_id",
+                match=MatchAny(any=allowed_sources)
+            )
+        )
+    
+    # Primary semantic search
     results = qdrant.query_points(
         collection_name="archive_documents",
         query=embedding,
-        query_filter=Filter(
-            must=[
-                FieldCondition(
-                    key="access_level",
-                    match=MatchAny(any=user_permissions)
-                )
-            ]
-        ),
-        limit=5,
+        query_filter=Filter(must=filter_conditions),
+        limit=15,
         with_payload=True
     )
 
-    return results.points
+    semantic_results = results.points
+    
+    # Extract key terms for keyword boost
+    import re
+    key_terms = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', question)
+    key_terms.extend(re.findall(r'"([^"]+)"', question))  # Quoted terms
+    
+    # Check if query looks like an entity name (2-3 capitalized words)
+    is_likely_entity_query = len(key_terms) >= 2 and len(key_terms) <= 3 and all(len(term.split()) <= 2 for term in key_terms)
+    
+    # If we have specific terms, do additional keyword search
+    if key_terms:
+        # Get more results for keyword filtering
+        extended_results = qdrant.query_points(
+            collection_name="archive_documents",
+            query=embedding,
+            query_filter=Filter(must=filter_conditions),
+            limit=50,  # Get more for keyword filtering
+            with_payload=True
+        )
+        
+        # Boost results that contain key terms
+        boosted_results = []
+        seen_ids = set()
+        keyword_match_results = []
+        
+        # First, prioritize results that contain ALL key terms (exact match for entity names)
+        if is_likely_entity_query:
+            full_entity = " ".join(key_terms).lower()
+            for hit in extended_results.points:
+                text = hit.payload.get('text', '').lower()
+                # Check for exact entity name match (case-insensitive)
+                if full_entity in text:
+                    if hit.id not in seen_ids:
+                        hit.score = hit.score * 5.0  # Very strong boost for exact matches
+                        keyword_match_results.append(hit)
+                        seen_ids.add(hit.id)
+        
+        # Then add results that contain any key term
+        for hit in extended_results.points:
+            text = hit.payload.get('text', '').lower()
+            if any(term.lower() in text for term in key_terms):
+                if hit.id not in seen_ids:
+                    # Strong boost for keyword matches
+                    boost_factor = 2.0
+                    # Extra boost for longer, more descriptive content
+                    if len(text) > 1000 and any(len(term) > 5 for term in key_terms):
+                        boost_factor = 3.0
+                    hit.score = hit.score * boost_factor
+                    boosted_results.append(hit)
+                    seen_ids.add(hit.id)
+        
+        # Combine: exact matches first, then keyword matches, then semantic
+        final_results = keyword_match_results + boosted_results
+        
+        # Add semantic results that weren't already included
+        for hit in semantic_results:
+            if hit.id not in seen_ids:
+                final_results.append(hit)
+                seen_ids.add(hit.id)
+        
+        # Sort by boosted scores and limit
+        final_results.sort(key=lambda x: x.score, reverse=True)
+        
+        # Normalize scores to cap at 1.0 (100%) while preserving relative ordering
+        if final_results:
+            max_score = max(hit.score for hit in final_results)
+            if max_score > 1.0:
+                # Normalize: scale all scores so the max is 1.0
+                for hit in final_results:
+                    hit.score = min(hit.score / max_score, 1.0)
+        
+        return final_results[:15]
+    
+    return semantic_results
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
@@ -593,15 +959,44 @@ async def handle_query(request: QueryRequest):
         # User permissions (hardcoded for PoC)
         permissions = ["public", "researcher"]
 
-        # 1. Query Graphiti (knowledge graph)
-        print(f"Querying Graphiti: {request.question}")
+        # Get excluded sources (temporary exclusion)
+        excluded_sources = request.excluded_sources or []
+        excluded_set = set(excluded_sources)
+        
+        # Calculate allowed sources (active sources minus excluded)
+        active_sources = get_active_sources()
+        allowed_sources = [s for s in active_sources if s not in excluded_set]
+        
+        # Convert excluded doc_ids to group_ids for filtering
+        import re
+        excluded_group_ids = set([re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id) for doc_id in excluded_sources])
+
+        # 1. Query Graphiti (knowledge graph) - only query allowed sources
+        print(f"Querying Graphiti: {request.question} (allowed sources: {allowed_sources})")
         (
             graph_entities,
             graph_relationships,
             graph_episodes,
-            graph_preview
-        ) = await query_graphiti(request.question)
+            graph_preview,
+            facts_struct
+        ) = await query_graphiti(request.question, allowed_sources=allowed_sources)
         graph_entities = graph_entities or []
+        
+        # Filter Graphiti results by excluded sources (using group_id comparison)
+        if excluded_group_ids:
+            graph_entities = [
+                entity for entity in graph_entities
+                if entity.get("group_id") not in excluded_group_ids
+            ]
+            graph_relationships = [
+                rel for rel in (graph_relationships or [])
+                if rel.get("group_id") not in excluded_group_ids
+            ]
+            graph_episodes = [
+                ep for ep in (graph_episodes or [])
+                if ep.get("group_id") not in excluded_group_ids
+            ]
+        
         # Filter out noise entities
         graph_entities = [
             entity for entity in graph_entities
@@ -618,10 +1013,20 @@ async def handle_query(request: QueryRequest):
                     for name in guessed
                 ]
                 entity_names = guessed
+        
+        # Filter guessed entities: ensure they can only be mapped to allowed sources
+        # This will be handled during verification, but we pre-mark them to avoid excluded sources
 
         # 2. Query Qdrant (document chunks)
         print(f"Querying Qdrant: {request.question}")
-        doc_results = query_qdrant(request.question, permissions)
+        doc_results = query_qdrant(request.question, permissions, excluded_sources)
+        
+        # Filter Qdrant results by excluded sources
+        if excluded_set:
+            doc_results = [
+                hit for hit in doc_results
+                if hit.payload.get("doc_id") not in excluded_set
+            ]
 
         initial_entity_names = [entity.get("name") for entity in graph_entities if entity.get("name")]
         graph_episodes = filter_episodes(graph_episodes, initial_entity_names, query_terms)
@@ -641,6 +1046,63 @@ async def handle_query(request: QueryRequest):
             entity for entity in graph_entities
             if not is_noise_entity(entity.get("name", ""))
         ]
+        
+        # Verify and map entities to their actual documents
+        for entity in graph_entities:
+            entity_name = entity.get("name")
+            if not entity_name:
+                continue
+            
+            # If entity already has group_id, verify it's correct and not excluded
+            current_group_id = entity.get("group_id")
+            if current_group_id:
+                # First check if this group_id is from an excluded source
+                if current_group_id in excluded_group_ids:
+                    print(f"⚠️  Entity '{entity_name}' from excluded source (group_id: {current_group_id}) - marking for removal")
+                    entity["_not_found_in_docs"] = True
+                    continue  # Skip further verification for excluded entities
+                
+                # Convert group_id back to doc_id format for verification
+                # Try to find matching doc_id
+                doc_ids = list_document_ids()
+                import re
+                matching_doc = None
+                for doc_id in doc_ids:
+                    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id)
+                    if sanitized == current_group_id:
+                        matching_doc = doc_id
+                        break
+                
+                # Check if matching document is excluded
+                if matching_doc and matching_doc in excluded_set:
+                    print(f"⚠️  Entity '{entity_name}' from excluded document '{matching_doc}' - marking for removal")
+                    entity["_not_found_in_docs"] = True
+                    continue  # Skip further verification for excluded entities
+                
+                # Verify entity exists in that document
+                if matching_doc:
+                    if not verify_entity_in_document(entity_name, matching_doc):
+                        # Entity not in attributed document - clear group_id and find correct one
+                        print(f"⚠️  Entity '{entity_name}' attributed to '{matching_doc}' but not found there. Searching for correct document...")
+                        entity["group_id"] = None
+                        entity["_verification_failed"] = matching_doc
+            
+            # If entity doesn't have group_id or verification failed, find correct documents
+            if not entity.get("group_id"):
+                matching_docs = map_entity_to_documents(entity_name)
+                # Filter matching docs to only include allowed sources
+                matching_docs = [doc for doc in matching_docs if doc not in excluded_set]
+                if matching_docs:
+                    # Use first matching document
+                    matching_doc = matching_docs[0]
+                    import re
+                    entity["group_id"] = re.sub(r'[^a-zA-Z0-9_-]', '_', matching_doc)
+                    entity["doc_id"] = matching_doc  # Store original doc_id too
+                    print(f"✓ Mapped entity '{entity_name}' to document '{matching_doc}'")
+                else:
+                    # Entity not found in allowed documents - mark for removal
+                    print(f"⚠️  Entity '{entity_name}' not found in allowed documents")
+                    entity["_not_found_in_docs"] = True
 
         # Fallback entities if none returned
         if not graph_entities and doc_results:
@@ -759,15 +1221,84 @@ async def handle_query(request: QueryRequest):
             for entry in timeline_entries:
                 context_parts.append(f"- {entry}")
 
-        if not graph_relationships and entity_snippets:
+        # If we have Graphiti facts, replace any broken relationships with better ones
+        if facts_struct:
+            # Check if relationships have empty 'to' fields (indicating broken normalization)
+            has_meaningful_relationships = graph_relationships and any(rel.get("to") for rel in graph_relationships)
+            if not has_meaningful_relationships:
+                # Clear broken relationships and create new ones from facts
+                graph_relationships = []
+                facts_data = _unwrap_structured(facts_struct)
+                seen_questions = set()
+                
+                for fact in facts_data.get("facts", [])[:10]:  # Limit to 10 facts
+                    if not isinstance(fact, dict):
+                        continue
+                        
+                    fact_text = fact.get("fact", "")
+                    if not fact_text:
+                        continue
+                        
+                    # Generate a better follow-up question
+                    followup = generate_fact_based_followup(fact_text, fact.get("name", ""))
+                    
+                    # Only add unique questions
+                    if followup not in seen_questions:
+                        seen_questions.add(followup)
+                        graph_relationships.append({
+                            "from": "",
+                            "to": "",
+                            "type": fact.get("name", "relationship"),
+                            "fact": fact_text[:200],
+                            "followup_question": followup
+                        })
+        
+        # Fallback: Create relationships from Graphiti entities if still no relationships
+        elif not graph_relationships and entity_snippets:
+            seen_questions = set()  # Track unique follow-up questions
+            
             for snippet in entity_snippets:
-                graph_relationships.append({
-                    "from": snippet["source"],
-                    "to": snippet["name"],
-                    "type": "mentions",
-                    "fact": snippet["snippet"],
-                    "followup_question": snippet["snippet"]
-                })
+                # Create clean, readable relationship facts
+                entity_name = snippet["name"]
+                source_doc = snippet["source"]
+                raw_snippet = snippet["snippet"]
+                
+                # Generate a clean fact statement
+                clean_fact = f"{source_doc} mentions {entity_name}"
+                
+                # Try to extract key context from snippet
+                # Look for the sentence containing the entity name
+                sentences = raw_snippet.split('. ')
+                best_sentence = ""
+                
+                for sentence in sentences:
+                    if entity_name.lower() in sentence.lower() and len(sentence) < 200:
+                        best_sentence = sentence.strip()
+                        if not best_sentence.endswith('.'):
+                            best_sentence += '.'
+                        break
+                
+                if best_sentence:
+                    clean_fact = f"{source_doc} mentions {entity_name}: {best_sentence}"
+                elif sentences and len(sentences[0]) < 150:
+                    context = sentences[0].strip()
+                    if context and not context.endswith('.'):
+                        context += '.'
+                    clean_fact = f"{source_doc} mentions {entity_name}: {context}"
+                
+                # Generate a meaningful follow-up question based on the relationship context
+                followup = generate_contextual_followup(entity_name, best_sentence or raw_snippet)
+                
+                # Only add if we haven't seen this follow-up question before
+                if followup not in seen_questions:
+                    seen_questions.add(followup)
+                    graph_relationships.append({
+                        "from": source_doc,
+                        "to": entity_name,
+                        "type": "mentions",
+                        "fact": clean_fact[:200],  # Limit length
+                        "followup_question": followup
+                    })
 
         # Fallback episodes from Qdrant hits if Graphiti has none yet
         if doc_results:
@@ -821,7 +1352,8 @@ RULES:
 2. When sources contradict, acknowledge explicitly
 3. Use temporal language when relevant
 4. Distinguish official vs. community perspectives
-5. Be honest about uncertainty"""
+5. Be honest about uncertainty
+6. Provide consistent, deterministic responses"""
                 },
                 {
                     "role": "user",
@@ -833,8 +1365,10 @@ QUESTION: {request.question}
 Provide a comprehensive answer with citations to document titles. If the context doesn't contain relevant information, say so."""
                 }
             ],
-            temperature=0.3,
-            max_tokens=800
+            temperature=0.0,
+            max_tokens=800,
+            seed=42,
+            top_p=1.0
         )
 
         answer = response.choices[0].message.content
@@ -844,17 +1378,69 @@ Provide a comprehensive answer with citations to document titles. If the context
             entity for entity in graph_entities
             if not is_noise_entity(entity.get("name", ""))
         ]
+        
+        # Final filter: Remove entities from excluded sources (check both doc_id and group_id)
+        if excluded_set or excluded_group_ids:
+            final_filtered_entities = []
+            for entity in graph_entities:
+                # Check doc_id first
+                entity_doc_id = entity.get("doc_id")
+                if entity_doc_id and entity_doc_id in excluded_set:
+                    continue  # Skip entities from excluded documents
+                
+                # Check group_id as backup
+                entity_group_id = entity.get("group_id")
+                if entity_group_id and entity_group_id in excluded_group_ids:
+                    continue  # Skip entities from excluded group_ids
+                
+                # Also skip entities marked as not found in allowed docs
+                if entity.get("_not_found_in_docs"):
+                    continue
+                
+                final_filtered_entities.append(entity)
+            graph_entities = final_filtered_entities
+        
+        # Ensure all entities have doc_id for frontend display
+        # But also filter out any that map to excluded sources
+        final_entities = []
+        for entity in graph_entities:
+            if not entity.get("doc_id") and entity.get("group_id"):
+                doc_id = group_id_to_doc_id(entity.get("group_id"))
+                if doc_id:
+                    entity["doc_id"] = doc_id
+                    # Check again if this doc_id is excluded
+                    if doc_id in excluded_set:
+                        continue  # Skip entities from excluded documents
+            
+            # Final check: skip if entity is from excluded source
+            if entity.get("doc_id") and entity.get("doc_id") in excluded_set:
+                continue
+            if entity.get("group_id") and entity.get("group_id") in excluded_group_ids:
+                continue
+            if entity.get("_not_found_in_docs"):
+                continue
+                
+            final_entities.append(entity)
+        graph_entities = final_entities
+
+        # 5. Deduplicate sources and keep highest relevance score
+        sources_dict = {}
+        for hit in doc_results:
+            title = hit.payload["title"]
+            score = hit.score
+            if title not in sources_dict or score > sources_dict[title]["relevance"]:
+                sources_dict[title] = {
+                    "title": title,
+                    "relevance": score
+                }
+        
+        # Sort by relevance (highest first)
+        deduplicated_sources = sorted(sources_dict.values(), key=lambda x: x["relevance"], reverse=True)
 
         # 5. Return structured response
         return {
             "answer": answer,
-            "sources": [
-                {
-                    "title": hit.payload["title"],
-                    "relevance": hit.score
-                }
-                for hit in doc_results
-            ],
+            "sources": deduplicated_sources,
             "graph_context": (graph_preview or "")[:200],  # Preview
             "graph_entities": graph_entities,
             "graph_relationships": graph_relationships,
