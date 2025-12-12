@@ -329,3 +329,4 @@ nodes, preview = await call_graphiti_tool(
 | Get connected nodes | `MATCH (n)-[*1..2]-(m) WHERE n.name CONTAINS 'TERM' RETURN *` |
 
 
+

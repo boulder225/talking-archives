@@ -165,3 +165,4 @@ This will show:
 - **Graphiti not responding?** Check if the Graphiti MCP service is running at port 8000
 
 
+

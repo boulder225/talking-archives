@@ -1,5 +1,5 @@
 # main.py - FastAPI backend
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -17,10 +17,20 @@ import re
 from pathlib import Path
 from typing import List, Optional
 from ingest import ingest_document as ingest_single_document, list_document_ids, qdrant_point_id
+import uuid
+import aiofiles
+from pdf2image import convert_from_path
+from PIL import Image
+import pytesseract
 
 load_dotenv()
 
 app = FastAPI()
+
+# Directories
+DOCUMENTS_DIR = Path("documents")
+UPLOADS_DIR = Path("uploads")
+UPLOADS_DIR.mkdir(exist_ok=True)
 
 # Source state tracking
 STATE_FILE = Path("sources_state.json")
@@ -1510,11 +1520,224 @@ async def remove_source(doc_id: str):
     if doc_id not in available:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    delete_qdrant_points([doc_id])
-    await clear_graphiti_groups([doc_id])
+    errors = []
+    
+    # Try to delete from Qdrant
+    try:
+        delete_qdrant_points([doc_id])
+    except Exception as e:
+        error_str = str(e)
+        if "Connection refused" in error_str or "errno 61" in error_str or "ConnectError" in str(type(e).__name__):
+            errors.append(f"Qdrant (port 6333) not available - data not removed from vector database")
+        else:
+            errors.append(f"Failed to delete from Qdrant: {error_str}")
+    
+    # Try to delete from Graphiti
+    try:
+        await clear_graphiti_groups([doc_id])
+    except Exception as e:
+        error_str = str(e)
+        if "Connection refused" in error_str or "All connection attempts failed" in error_str or "ConnectError" in str(type(e).__name__):
+            errors.append(f"Graphiti (port 8000) not available - data not removed from knowledge graph")
+        else:
+            errors.append(f"Failed to delete from Graphiti: {error_str}")
+    
+    # Always mark as inactive in local state
     set_source_active(doc_id, False)
-
+    
+    if errors:
+        # Return partial success with warnings
+        return {
+            "status": "partially_removed",
+            "doc_id": doc_id,
+            "message": f"Document marked as inactive locally, but some services were unavailable: {'; '.join(errors)}"
+        }
+    
     return {"status": "removed", "doc_id": doc_id}
+
+
+@app.post("/upload-ocr")
+async def upload_ocr(
+    file: UploadFile = File(...),
+    doc_name: Optional[str] = Form(None)
+):
+    """
+    Upload an image (JPG, PNG, TIFF) or PDF file for OCR processing.
+    Extracts text and adds it as a new document to the archive.
+    """
+    # Validate file type
+    file_ext = Path(file.filename).suffix.lower()
+    allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif'}
+    
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type not supported. Allowed: {', '.join(allowed_extensions)}"
+        )
+    
+    # Generate unique filename for temporary storage
+    temp_id = str(uuid.uuid4())
+    temp_file_path = UPLOADS_DIR / f"{temp_id}{file_ext}"
+    
+    try:
+        # Save uploaded file
+        async with aiofiles.open(temp_file_path, "wb") as buffer:
+            content = await file.read()
+            await buffer.write(content)
+        
+        # Extract text using OCR
+        extracted_text = None
+        
+        if file_ext == '.pdf':
+            # Convert PDF to images and extract text from each page
+            try:
+                images = convert_from_path(str(temp_file_path))
+                text_parts = []
+                for img in images:
+                    text = pytesseract.image_to_string(img)
+                    text_parts.append(text)
+                extracted_text = '\n\n'.join(text_parts)
+            except Exception as e:
+                error_str = str(e)
+                if "Connection refused" in error_str or "errno 61" in error_str:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Error processing PDF (connection issue): {error_str}. Make sure poppler is installed (macOS: brew install poppler)."
+                    )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error processing PDF: {error_str}. Make sure poppler is installed."
+                )
+        else:
+            # Process image directly
+            try:
+                img = Image.open(temp_file_path)
+                extracted_text = pytesseract.image_to_string(img)
+            except Exception as e:
+                error_str = str(e)
+                if "Connection refused" in error_str or "errno 61" in error_str:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Error processing image (connection issue): {error_str}. Check tesseract installation."
+                    )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error processing image: {error_str}"
+                )
+        
+        if not extracted_text or not extracted_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="No text could be extracted from the file. Please check the image quality."
+            )
+        
+        # Generate document ID from filename or provided name
+        if doc_name:
+            doc_id = doc_name.strip()
+        else:
+            doc_id = Path(file.filename).stem
+        
+        # Ensure doc_id is safe and unique
+        doc_id = re.sub(r'[^a-zA-Z0-9_-]', '_', doc_id)
+        if not doc_id:
+            doc_id = f"ocr_document_{temp_id[:8]}"
+        
+        # Check if document already exists, append number if needed
+        new_doc_path = DOCUMENTS_DIR / f"{doc_id}.txt"
+        if new_doc_path.exists():
+            counter = 1
+            while (DOCUMENTS_DIR / f"{doc_id}_{counter}.txt").exists():
+                counter += 1
+            doc_id = f"{doc_id}_{counter}"
+            new_doc_path = DOCUMENTS_DIR / f"{doc_id}.txt"
+        
+        # Save extracted text as document
+        async with aiofiles.open(new_doc_path, "w", encoding='utf-8') as f:
+            await f.write(extracted_text)
+        
+        # Ingest the new document into Qdrant and Graphiti
+        try:
+            await ingest_single_document(
+                doc_id,
+                openai_client=openai_client,
+                qdrant_client=qdrant,
+                recreate_collection=False
+            )
+            set_source_active(doc_id, True)
+            ingestion_success = True
+        except Exception as ingest_error:
+            # Check if it's a connection error
+            error_msg = str(ingest_error)
+            error_type = type(ingest_error).__name__
+            
+            # Check for various connection error indicators
+            is_connection_error = (
+                "Connection refused" in error_msg or 
+                "errno 61" in error_msg or 
+                "ConnectionError" in error_msg or
+                "ConnectError" in error_type or
+                "ResponseHandlingException" in error_type
+            )
+            
+            if is_connection_error:
+                # Determine which service is likely down
+                service_hint = ""
+                if "6333" in error_msg or "qdrant" in error_msg.lower():
+                    service_hint = "Qdrant (port 6333) is not running."
+                elif "8000" in error_msg or "graphiti" in error_msg.lower():
+                    service_hint = "Graphiti (port 8000) is not running."
+                else:
+                    service_hint = "Qdrant (port 6333) or Graphiti (port 8000) may not be running."
+                
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"✓ Text extracted successfully ({len(extracted_text)} characters), but failed to ingest into archive. {service_hint} The extracted text has been saved to: {new_doc_path}. Please start the required services and try re-ingesting this document later."
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"✓ Text extracted successfully ({len(extracted_text)} characters), but failed to ingest: {error_msg}. The extracted text has been saved to: {new_doc_path}."
+                )
+        
+        # Clean up temporary file
+        temp_file_path.unlink(missing_ok=True)
+        
+        return {
+            "status": "success",
+            "doc_id": doc_id,
+            "message": f"Document '{doc_id}' extracted via OCR and added to archive.",
+            "extracted_text_length": len(extracted_text),
+            "preview": extracted_text[:200] + "..." if len(extracted_text) > 200 else extracted_text
+        }
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (they already have proper error messages)
+        if temp_file_path.exists():
+            temp_file_path.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        # Clean up on any other error
+        error_str = str(e)
+        if temp_file_path.exists():
+            temp_file_path.unlink(missing_ok=True)
+        
+        # Check for connection errors
+        if "Connection refused" in error_str or "errno 61" in error_str or "ConnectionError" in str(type(e).__name__):
+            # Determine which service might be down
+            detail_msg = f"Connection error: {error_str}. "
+            if "6333" in error_str or "qdrant" in error_str.lower():
+                detail_msg += "Qdrant (port 6333) may not be running."
+            elif "8000" in error_str or "graphiti" in error_str.lower():
+                detail_msg += "Graphiti (port 8000) may not be running."
+            else:
+                detail_msg += "One of the required services (Qdrant port 6333 or Graphiti port 8000) may not be running."
+            
+            raise HTTPException(status_code=503, detail=detail_msg)
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing file: {error_str}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
